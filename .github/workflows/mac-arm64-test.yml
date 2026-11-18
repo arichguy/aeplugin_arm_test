@@ -1,9 +1,9 @@
 name: mac-arm64-load-test
 
-# 在 Apple Silicon（macos-14 就是 arm64）上验证加壳后的 macOS 插件：
-#   1. 从 .plugin 里解出载荷镜像
-#   2. 检查文件类型与签名
-#   3. 让系统真的 dlopen 它（等价于 dyld 在 AE 里的动作）
+# 在 Apple Silicon（macos-15 就是 arm64）上验证加壳后的 macOS 插件：
+#   1. 从每个 .plugin 里解出载荷镜像
+#   2. 检查文件类型、签名、架构
+#   3. 让系统真的 dlopen 它，并检查 EffectMain / PluginDataEntryFunction
 #
 # 用法：把 .plugin 文件夹和这个文件传到仓库，然后 Actions 页面点 "Run workflow"
 
@@ -22,20 +22,9 @@ jobs:
           sw_vers
           python3 --version
 
-      - name: 找到插件包
-        id: find
+      - name: 准备解密脚本
         run: |
-          PLUGIN=$(find . -maxdepth 5 -name '*.plugin' -type d | head -n 1)
-          if [ -z "$PLUGIN" ]; then
-            echo "仓库里没有找到 .plugin 文件夹" >&2
-            exit 1
-          fi
-          echo "plugin=$PLUGIN" >> "$GITHUB_OUTPUT"
-          echo "找到: $PLUGIN"
-
-      - name: 解密载荷
-        run: |
-          python3 - "${{ steps.find.outputs.plugin }}" /tmp/payload.bin <<'PY'
+          cat > /tmp/decrypt.py <<'PY'
           import os, struct, sys
 
           GOLDEN = 0x9E3779B97F4A7C15
@@ -55,7 +44,7 @@ jobs:
           stub = open(os.path.join(macos, exe), 'rb').read()
           i = stub.find(b'AEXKEY')
           if i < 0:
-              sys.exit('stub 里找不到密钥标记，这个包没加壳或不是本工具打的')
+              sys.exit('stub 里找不到密钥标记（这个包没加壳或不是本工具打的）')
           key = struct.unpack('<Q', stub[i + 6:i + 14])[0]
 
           enc = open(os.path.join(bundle, 'Contents', 'Resources', exe + '.aexdata'), 'rb').read()
@@ -72,34 +61,48 @@ jobs:
 
           open(out, 'wb').write(buf)
           os.chmod(out, 0o755)
-          print('key       = %016x' % key)
-          print('decrypted = %d bytes' % len(buf))
-          print('magic     = %s' % bytes(buf[:4]).hex())
-          if bytes(buf[:4]) == b'\xca\xfe\xba\xbe':
-              print('type      = universal (fat)')
+          print('  key       = %016x' % key)
+          print('  decrypted = %d bytes' % len(buf))
+          print('  magic     = %s' % bytes(buf[:4]).hex())
           PY
 
-      - name: 检查镜像与签名
+      - name: 逐个测试仓库里的 .plugin
         run: |
-          file /tmp/payload.bin
-          echo "---- codesign ----"
-          codesign -dvvv /tmp/payload.bin 2>&1 | head -20 || true
-          echo "---- 架构 ----"
-          lipo -archs /tmp/payload.bin || true
+          set -e
+          found=0
+          for P in $(find . -maxdepth 3 -name '*.plugin' -type d | sort); do
+            found=1
+            echo ""
+            echo "==================== $P ===================="
+            python3 /tmp/decrypt.py "$P" /tmp/payload.bin
 
-      - name: 加载测试（关键）
-        run: |
-          lipo -thin arm64 /tmp/payload.bin -output /tmp/payload_arm64.bin
-          echo "---- arm64 切片的导出符号 ----"
-          nm -gU /tmp/payload_arm64.bin | grep -E 'EffectMain|PluginDataEntry' || true
-          python3 - <<'PY'
+            echo "---- 文件类型 ----"
+            file /tmp/payload.bin
+
+            echo "---- 签名 ----"
+            codesign -dvvv /tmp/payload.bin 2>&1 | head -6 || true
+
+            echo "---- 架构 ----"
+            lipo -archs /tmp/payload.bin || true
+
+            echo "---- arm64 切片导出符号 ----"
+            lipo -thin arm64 /tmp/payload.bin -output /tmp/payload_arm64.bin
+            nm -gU /tmp/payload_arm64.bin | grep -E 'EffectMain|PluginDataEntry' || true
+
+            echo "---- 加载测试（关键）----"
+            python3 - <<'PY'
           import ctypes
           h = ctypes.CDLL('/tmp/payload.bin')
           print('LOAD OK  <- arm64 上可以正常加载')
           for name in ('EffectMain', 'PluginDataEntryFunction'):
-              getattr(h, name)   # 取不到就抛 AttributeError
+              getattr(h, name)
               print('symbol %s: OK' % name)
           PY
+          done
 
-      - name: 结论
-        run: echo "arm64 加载测试通过：这份加壳插件在 Apple Silicon 上可用"
+          if [ "$found" = "0" ]; then
+            echo "仓库里没有找到 .plugin 文件夹" >&2
+            exit 1
+          fi
+          echo ""
+          echo "全部通过：这些加壳插件在 Apple Silicon 上可加载"
