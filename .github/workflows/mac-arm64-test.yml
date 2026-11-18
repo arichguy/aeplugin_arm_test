@@ -1,0 +1,101 @@
+name: mac-arm64-load-test
+
+# 在 Apple Silicon（macos-14 就是 arm64）上验证加壳后的 macOS 插件：
+#   1. 从 .plugin 里解出载荷镜像
+#   2. 检查文件类型与签名
+#   3. 让系统真的 dlopen 它（等价于 dyld 在 AE 里的动作）
+#
+# 用法：把 .plugin 文件夹和这个文件传到仓库，然后 Actions 页面点 "Run workflow"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  arm64-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          echo "CPU: $(uname -m)"
+          sw_vers
+          python3 --version
+
+      - name: 找到插件包
+        id: find
+        run: |
+          PLUGIN=$(find . -maxdepth 5 -name '*.plugin' -type d | head -n 1)
+          if [ -z "$PLUGIN" ]; then
+            echo "仓库里没有找到 .plugin 文件夹" >&2
+            exit 1
+          fi
+          echo "plugin=$PLUGIN" >> "$GITHUB_OUTPUT"
+          echo "找到: $PLUGIN"
+
+      - name: 解密载荷
+        run: |
+          python3 - "${{ steps.find.outputs.plugin }}" /tmp/payload.bin <<'PY'
+          import os, struct, sys
+
+          GOLDEN = 0x9E3779B97F4A7C15
+          MASK = (1 << 64) - 1
+
+          def mix(z):
+              z = (z + GOLDEN) & MASK
+              z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK
+              z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK
+              return z ^ (z >> 31)
+
+          bundle, out = sys.argv[1], sys.argv[2]
+          macos = os.path.join(bundle, 'Contents', 'MacOS')
+          exe = [n for n in os.listdir(macos)
+                 if os.path.isfile(os.path.join(macos, n)) and not n.startswith('.')][0]
+
+          stub = open(os.path.join(macos, exe), 'rb').read()
+          i = stub.find(b'AEXKEY')
+          if i < 0:
+              sys.exit('stub 里找不到密钥标记，这个包没加壳或不是本工具打的')
+          key = struct.unpack('<Q', stub[i + 6:i + 14])[0]
+
+          enc = open(os.path.join(bundle, 'Contents', 'Resources', exe + '.aexdata'), 'rb').read()
+          buf = bytearray(enc)
+          n = len(buf) // 8
+          for k in range(n):
+              w = struct.unpack_from('<Q', buf, k * 8)[0]
+              struct.pack_into('<Q', buf, k * 8, w ^ mix(key + k * GOLDEN))
+          rest = len(buf) - n * 8
+          if rest:
+              kk = mix(key + n * GOLDEN)
+              for b in range(rest):
+                  buf[n * 8 + b] ^= (kk >> (b * 8)) & 0xFF
+
+          open(out, 'wb').write(buf)
+          os.chmod(out, 0o755)
+          print('key       = %016x' % key)
+          print('decrypted = %d bytes' % len(buf))
+          print('magic     = %s' % bytes(buf[:4]).hex())
+          if bytes(buf[:4]) == b'\xca\xfe\xba\xbe':
+              print('type      = universal (fat)')
+          PY
+
+      - name: 检查镜像与签名
+        run: |
+          file /tmp/payload.bin
+          echo "---- codesign ----"
+          codesign -dvvv /tmp/payload.bin 2>&1 | head -20 || true
+          echo "---- 架构 ----"
+          lipo -archs /tmp/payload.bin || true
+
+      - name: 加载测试（关键）
+        run: |
+          python3 - <<'PY'
+          import ctypes
+          h = ctypes.CDLL('/tmp/payload.bin')
+          print('LOAD OK  <- arm64 上可以正常加载')
+          names = [n for n in dir(h) if 'ffect' in n or 'lugin' in n]
+          print('导出入口:', names)
+          PY
+
+      - name: 结论
+        run: echo "arm64 加载测试通过：这份加壳插件在 Apple Silicon 上可用"
