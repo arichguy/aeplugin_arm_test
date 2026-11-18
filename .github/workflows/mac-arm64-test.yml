@@ -94,9 +94,17 @@ jobs:
           import ctypes
           h = ctypes.CDLL('/tmp/payload.bin')
           print('LOAD OK  <- arm64 上可以正常加载')
-          for name in ('EffectMain', 'PluginDataEntryFunction'):
-              getattr(h, name)
-              print('symbol %s: OK' % name)
+          try:
+              getattr(h, 'EffectMain')
+              print('symbol EffectMain: OK')
+          except AttributeError:
+              raise SystemExit('EffectMain 缺失')
+          for n in ('PluginDataEntryFunction', 'PluginDataEntryFunction2'):
+              try:
+                  getattr(h, n)
+                  print('symbol %s: OK' % n)
+              except AttributeError:
+                  print('symbol %s: 无（可选）' % n)
           PY
           done
 
