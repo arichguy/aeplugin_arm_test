@@ -1,0 +1,17 @@
+name: probe-runners
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    steps:
+      - name: who am i
+        run: |
+          echo "runner label: ${{ matrix.os }}"
+          uname -m
+          sw_vers
