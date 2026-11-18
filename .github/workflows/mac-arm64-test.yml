@@ -89,12 +89,16 @@ jobs:
 
       - name: 加载测试（关键）
         run: |
+          lipo -thin arm64 /tmp/payload.bin -output /tmp/payload_arm64.bin
+          echo "---- arm64 切片的导出符号 ----"
+          nm -gU /tmp/payload_arm64.bin | grep -E 'EffectMain|PluginDataEntry' || true
           python3 - <<'PY'
           import ctypes
           h = ctypes.CDLL('/tmp/payload.bin')
           print('LOAD OK  <- arm64 上可以正常加载')
-          names = [n for n in dir(h) if 'ffect' in n or 'lugin' in n]
-          print('导出入口:', names)
+          for name in ('EffectMain', 'PluginDataEntryFunction'):
+              getattr(h, name)   # 取不到就抛 AttributeError
+              print('symbol %s: OK' % name)
           PY
 
       - name: 结论
